@@ -45,7 +45,10 @@ ${YELLOW}OPTIONS:${NC}
     -f, --foreground                Run in foreground instead of tmux session
     -l, --list-roles                List available common roles
     -s, --status [name]             Check status of running delegate sessions
+    --check <name>                  Quick check if a session is running or done
+    --check-all                     Quick check status of all delegate sessions
     -k, --kill <name>               Kill a running delegate session
+    --continue <name> <message>     Send a follow-up message to an existing session
     -h, --help                      Show this help message
 
 ${YELLOW}EXAMPLES:${NC}
@@ -62,6 +65,15 @@ ${YELLOW}EXAMPLES:${NC}
 
     # Check status of all running tasks
     delegate.sh --status
+
+    # Quick check if a task is done
+    delegate.sh --check my-task
+
+    # Quick check all tasks
+    delegate.sh --check-all
+
+    # Send follow-up message to continue conversation
+    delegate.sh --continue my-task "Now also add unit tests for that feature"
 
     # Kill a running task
     delegate.sh --kill my-task
@@ -143,6 +155,158 @@ kill_session() {
         tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^delegate-" | sed 's/^delegate-/  /' || echo "  (none)"
         exit 1
     fi
+}
+
+check_session() {
+    local name="$1"
+    local session="delegate-$name"
+    
+    if tmux has-session -t "$session" 2>/dev/null; then
+        echo -e "${YELLOW}⏳ Running${NC}  $name"
+    else
+        # Check if there are log files for this session (it ran but completed)
+        local log_files=$(ls -t ${LOG_DIR}/*_${name}_*.log 2>/dev/null | head -1)
+        if [[ -n "$log_files" ]]; then
+            echo -e "${GREEN}✅ Done${NC}     $name"
+        else
+            echo -e "${RED}❓ Unknown${NC}  $name (no session or logs found)"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+check_all_sessions() {
+    echo -e "${GREEN}Delegate Session Status${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    
+    # Get all unique task names from logs and active sessions
+    local all_names=""
+    
+    # From active tmux sessions
+    local active=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^delegate-" | sed 's/^delegate-//' || true)
+    
+    # From log files (extract task name from filename pattern: YYYYMMDD_HHMMSS_name_stdout.log)
+    # The timestamp is 15 chars: YYYYMMDD_HHMMSS
+    local from_logs=$(ls ${LOG_DIR}/*_stdout.log 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/^[0-9]\{8\}_[0-9]\{6\}_//' | sed 's/_stdout\.log$//' | sort -u || true)
+    
+    # Combine and deduplicate
+    all_names=$(echo -e "$active\n$from_logs" | grep -v '^$' | sort -u)
+    
+    if [[ -z "$all_names" ]]; then
+        echo -e "${YELLOW}No delegate sessions found${NC}"
+        return 0
+    fi
+    
+    local running=0
+    local done=0
+    
+    for name in $all_names; do
+        if tmux has-session -t "delegate-$name" 2>/dev/null; then
+            echo -e "${YELLOW}⏳ Running${NC}  $name"
+            running=$((running + 1))
+        else
+            echo -e "${GREEN}✅ Done${NC}     $name"
+            done=$((done + 1))
+        fi
+    done
+    
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    echo -e "Total: ${YELLOW}$running running${NC}, ${GREEN}$done completed${NC}"
+}
+
+continue_session() {
+    local name="$1"
+    local message="$2"
+    local session="delegate-$name"
+    
+    if [[ -z "$message" ]]; then
+        echo -e "${RED}Error: No message provided for --continue${NC}"
+        echo -e "Usage: delegate.sh --continue <name> \"<message>\""
+        exit 1
+    fi
+    
+    # Find the most recent stderr log for this session to get the session ID
+    local stderr_log=$(ls -t ${LOG_DIR}/*_${name}_stderr.log 2>/dev/null | head -1)
+    
+    if [[ -z "$stderr_log" ]]; then
+        echo -e "${RED}Error: No logs found for session '$name'${NC}"
+        echo -e "Cannot continue a session that was never started."
+        exit 1
+    fi
+    
+    # Extract the codex session ID from the log
+    # Codex outputs something like "session id: abc123" or stores it in the log
+    local session_id=$(grep -oP 'session id:\s*\K[a-zA-Z0-9_-]+' "$stderr_log" | tail -1)
+    
+    if [[ -z "$session_id" ]]; then
+        # Try alternative pattern - codex might output it differently
+        session_id=$(grep -oP 'Session:\s*\K[a-zA-Z0-9_-]+' "$stderr_log" | tail -1)
+    fi
+    
+    if [[ -z "$session_id" ]]; then
+        # Try to find any session-like ID in the log
+        session_id=$(grep -oP 'ses_[a-zA-Z0-9]+' "$stderr_log" | tail -1)
+    fi
+    
+    if [[ -z "$session_id" ]]; then
+        echo -e "${RED}Error: Could not find codex session ID in logs${NC}"
+        echo -e "Log file: $stderr_log"
+        echo -e ""
+        echo -e "The session may have completed without storing a session ID,"
+        echo -e "or codex may not have output the session ID in a recognizable format."
+        echo -e ""
+        echo -e "You can try:"
+        echo -e "  1. Start a new task: delegate.sh -c <role> -g \"<goal>\" -t \"<task>\" -n new-name"
+        echo -e "  2. Check the log manually: tail $stderr_log"
+        exit 1
+    fi
+    
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}Continuing session: $name${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Session ID:${NC} $session_id"
+    echo -e "${YELLOW}Message:${NC} $message"
+    echo -e "${BLUE}───────────────────────────────────────────────────────────────${NC}"
+    
+    # Get log file base from original session
+    local log_base=$(echo "$stderr_log" | sed 's/_stderr\.log$//')
+    local stdout_log="${log_base}_stdout.log"
+    local continue_stderr="${log_base}_continue_stderr.log"
+    local continue_stdout="${log_base}_continue_stdout.log"
+    
+    # Check if there's still an active tmux session
+    if tmux has-session -t "$session" 2>/dev/null; then
+        echo -e "${YELLOW}Note: Original tmux session still active. Sending to that session.${NC}"
+        # Send the message to the existing tmux session
+        # Use codex exec --yolo resume <session_id> - (--yolo before subcommand, - reads prompt from stdin)
+        TMUX_CMD="echo '$message' | codex exec --yolo resume '$session_id' - 2> >(tee -a '$continue_stderr' >&2) | tee -a '$continue_stdout'"
+        tmux send-keys -t "$session" "$TMUX_CMD" Enter
+        echo -e "${GREEN}Message sent to active session${NC}"
+        echo -e "Attach with: tmux attach -t $session"
+    else
+        # Create a new tmux session that continues the codex conversation
+        local new_session="${session}-continue"
+        
+        # Check if continue session already exists
+        if tmux has-session -t "$new_session" 2>/dev/null; then
+            echo -e "${YELLOW}Continue session already exists, sending to it...${NC}"
+            TMUX_CMD="echo '$message' | codex exec --yolo resume '$session_id' - 2> >(tee -a '$continue_stderr' >&2) | tee -a '$continue_stdout'"
+            tmux send-keys -t "$new_session" "$TMUX_CMD" Enter
+        else
+            TMUX_CMD="echo '$message' | codex exec --yolo resume '$session_id' - 2> >(tee -a '$continue_stderr' >&2) | tee -a '$continue_stdout'; echo ''; echo 'Continuation completed. Press Enter to close or Ctrl+C to keep open.'; read"
+            tmux new-session -d -s "$new_session" "bash -c \"$TMUX_CMD\""
+            echo -e "${GREEN}✓ Continuation started in new tmux session${NC}"
+            echo -e "${YELLOW}Session:${NC} $new_session"
+        fi
+        
+        echo -e ""
+        echo -e "${YELLOW}Commands:${NC}"
+        echo -e "  Attach:  tmux attach -t $new_session"
+        echo -e "  Tail:    tail -f $continue_stderr"
+    fi
+    
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 }
 
 list_roles() {
@@ -243,6 +407,21 @@ while [[ $# -gt 0 ]]; do
         -k|--kill)
             kill_session "$2"
             shift 2
+            exit 0
+            ;;
+        --check)
+            check_session "$2"
+            shift 2
+            exit 0
+            ;;
+        --check-all)
+            check_all_sessions
+            shift
+            exit 0
+            ;;
+        --continue)
+            continue_session "$2" "$3"
+            shift 3
             exit 0
             ;;
         -h|--help)
