@@ -29,7 +29,16 @@ A utility for delegating complex tasks to an AI coding agent (`codex`) with stru
 | `-w`   | `--why`                 | The reasoning behind the task                       |
 | `-t`   | `--task-detail`         | Detailed task instructions                          |
 | `-n`   | `--name`                | Task name (used in log filenames)                   |
+| `-f`   | `--foreground`          | Run in foreground instead of tmux session           |
 | `-l`   | `--list-roles`          | List available common roles                         |
+| `-s`   | `--status`              | Show detailed status of running sessions            |
+|        | `--check`               | Quick check if a specific session is running/done   |
+|        | `--check-all`           | Quick status check of all delegate sessions         |
+|        | `--continue`            | Send follow-up message to continue a conversation   |
+| `-k`   | `--kill`                | Kill a specific running session                     |
+|        | `--clean`               | Kill all idle sessions (completed, waiting on read) |
+|        | `--clean-all`           | Kill ALL delegate sessions (including running)      |
+|        | `--purge [name]`        | Kill session(s) AND delete their log files          |
 | `-h`   | `--help`                | Show help message                                   |
 
 ## Common Roles
@@ -131,6 +140,12 @@ Tasks automatically run in tmux sessions by default. This means:
 # Check all running delegate sessions
 ./delegate.sh --status
 
+# Quick check if tasks are running or done
+./delegate.sh --check-all
+
+# Check a specific task
+./delegate.sh --check my-features
+
 # Filter by name pattern
 ./delegate.sh --status features
 
@@ -141,18 +156,55 @@ tmux attach -t delegate-my-features
 tail -f /tmp/delegate-logs/*my-features*_stderr.log
 ```
 
+### Continuing a Conversation
+
+If a task completes but you want to give follow-up instructions without starting fresh:
+
+```bash
+# Continue an existing session with a new message
+./delegate.sh --continue my-features "Now also add edge case scenarios for authentication failures"
+
+# The continuation will:
+# - Find the original codex session ID from logs
+# - Wait if previous task is still running (exponential backoff)
+# - Send your message to continue that conversation
+# - Preserve all context from the original task
+```
+
+This is useful when:
+- The agent finished but missed something
+- You want to refine or extend the output
+- You have follow-up tasks that build on previous work
+- Queuing up the next instruction while current task runs (it will wait automatically)
+
 ### Managing Sessions
 
 ```bash
 # Kill a specific session
 ./delegate.sh --kill my-features
 
-# Kill all delegate sessions
-tmux list-sessions -F '#{session_name}' | grep delegate | xargs -I {} tmux kill-session -t {}
+# Clean up all idle sessions (completed tasks still open)
+./delegate.sh --clean
 
-# Check if a specific task is still running
-tmux has-session -t delegate-my-features 2>/dev/null && echo "Running" || echo "Done"
+# Kill ALL delegate sessions (including running ones)
+./delegate.sh --clean-all
+
+# Delete a session AND its log files completely
+./delegate.sh --purge my-features
+
+# Delete ALL sessions and ALL logs (with confirmation prompt)
+./delegate.sh --purge
 ```
+
+### Session States
+
+The `--check-all` command shows three possible states:
+
+| State | Icon | Meaning |
+|-------|------|---------|  
+| Running | ⏳ | Task is actively processing (codex running) |
+| Idle | 💤 | Task complete, tmux session still open (waiting on read) |
+| Done | ✅ | Session closed, only logs remain |
 
 ### Batch Jobs Pattern
 
